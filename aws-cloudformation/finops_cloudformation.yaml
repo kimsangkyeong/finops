@@ -1,0 +1,456 @@
+# -----------------------------------------------------------------
+# File Name : finops_cloudformation.yaml
+# Description : Infrastructure as Code (IaC) template to automate
+#               AWS FinOps environment configuration
+#
+# Information :
+#   1. FinOps target resources and actions
+#      - EC2 : Instance start / stop
+#      - RDS : Cluster start / stop
+#      - EKS : Node resizing (min ~ max)
+#
+#   2. FinOps target selection and criteria
+#      - A resource is considered a FinOps target if it has either
+#        the "finops-start" or "finops-stop" tag key.
+#      - The tag value must follow the format below:
+#
+#          type=weekday@description=skip-exception/weekday-weekdays/everyday-daily
+#
+#        => The string before '@'  : execution decision criteria
+#        => The string after  '@'  : optional type description
+#
+#           . skip     : Identified as a FinOps target but excluded
+#                        from execution (temporary exclusion)
+#           . weekday  : FinOps actions are executed only on weekdays
+#                        (Monday to Friday)
+#           . everyday : FinOps actions are executed every day
+#                        (Monday to Sunday)
+# =================================================================
+# version     date       author      reason
+# -----------------------------------------------------------------
+#  1.0     2025.12.25    k.s.k       first edit with open.ai
+# -----------------------------------------------------------------
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  FinOps Auto Scheduler (EC2/RDS/Aurora/EKS) using EventBridge Scheduler -> Lambda.
+  Packaging: ZIP in S3 (finops_lambda.zip). Handler: finops_lambda_function.lambda_handler.
+  Runtime: python3.14, Arch: x86_64. No NAT/VPC endpoints created.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "1) Basic Information "
+        Parameters:
+          - ProjectName
+          - LambdaFunctionName
+
+      - Label:
+          default: "2) Lambda Code (S3 ZIP)"
+        Parameters:
+          - LambdaCodeS3Bucket
+          - LambdaCodeS3Key
+          - LambdaCodeS3ObjectVersion
+
+      - Label:
+          default: "3) Network (VPC / Subnet)"
+        Parameters:
+          - VpcId
+          - SubnetIds
+
+      - Label:
+          default: "4) Slack Notification "
+        Parameters:
+          - SlackBotToken
+          - SlackChannel
+
+      - Label:
+          default: "5) FinOps Settings "
+        Parameters:
+          - Regions
+          - EKSDefaultStartSize
+          - EKSDefaultStopSize
+
+      - Label:
+          default: "6) Scheduler Settings "
+        Parameters:
+          - StartCronExpression
+          - StopCronExpression
+          - ScheduleTimezone
+
+      - Label:
+          default: "7) Logging Settings"
+        Parameters:
+          - LogRetentionDays
+
+    ParameterLabels:
+      ProjectName:
+        default: "Project Name (Tag Prefix)"
+
+      LambdaFunctionName:
+        default: "Lambda Function Name "
+
+      LambdaCodeS3Bucket:
+        default: "S3 bucket where the Lambda ZIP package is stored"
+
+      LambdaCodeS3Key:
+        default: "S3 Key (ex: lambda/finops_lambda.zip)"
+
+      LambdaCodeS3ObjectVersion:
+        default: "S3 Object Version (Option, Only if S3 bucket versioning is enabled)"
+
+      VpcId:
+        default: "VPC ID (VPC that the Lambda function will connect to)"
+
+      SubnetIds:
+        default: "Subnet IDs (Subnet list for Lambda deployment)"
+
+      SlackBotToken:
+        default: "Slack Bot Token (for Slack notifications, No Eco.)"
+
+      SlackChannel:
+        default: "Slack Channel (for Slack notifications)"
+
+      Regions:
+        default: "Target AWS Regions (comma-separated)"
+
+      EKSDefaultStartSize:
+        default: "EKS Start desiredSize "
+
+      EKSDefaultStopSize:
+        default: "EKS Stop desiredSize "
+
+      StartCronExpression:
+        default: "Start Cron Expression"
+
+      StopCronExpression:
+        default: "Stop Cron Expression "
+
+      ScheduleTimezone:
+        default: "Scheduler Timezone "
+
+      LogRetentionDays:
+        default: "CloudWatch Logs retention period (days)"
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: finops
+    AllowedPattern: "^[a-zA-Z0-9-]+$"
+    Description: Project tag/name prefix.
+
+  LambdaFunctionName:
+    Type: String
+    Default: finops-auto-scheduler-ec2-aurora-eks
+    AllowedPattern: "^[a-zA-Z0-9-_]+$"
+    Description: Lambda function name.
+
+  # --- Lambda ZIP package in S3 ---
+  LambdaCodeS3Bucket:
+    Type: String
+    Description: S3 bucket that contains finops_lambda.zip.
+
+  LambdaCodeS3Key:
+    Type: String
+    Default: lambda/finops_lambda.zip
+    Description: S3 key for the Lambda zip (e.g. lambda/finops_lambda.zip).
+
+  LambdaCodeS3ObjectVersion:
+    Type: String
+    Default: ""
+    Description: Optional. Set only if S3 bucket versioning is enabled and you want a fixed version.
+
+  # --- Networking (existing) ---
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Existing VPC ID where Lambda will be attached.
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Existing subnet IDs for Lambda VPC config (must have route to AWS APIs + Slack).
+
+  # --- Slack ---
+  SlackBotToken:
+    Type: String
+    NoEcho: true
+    Description: Slack Bot token (xxxx-...).
+
+  SlackChannel:
+    Type: String
+    Default: "finops-message"
+    Description: Slack channel name.
+
+  # --- FinOps settings ---
+  Regions:
+    Type: String
+    Default: ap-northeast-2
+    Description: "Comma-separated regions. Example: ap-northeast-2,ap-southeast-2"
+
+  EKSDefaultStartSize:
+    Type: Number
+    Default: 10
+    MinValue: 1
+
+  EKSDefaultStopSize:
+    Type: Number
+    Default: 0
+    MinValue: 0
+
+  # --- Scheduler settings ---
+  StartCronExpression:
+    Type: String
+    Default: "cron(50 8 * * ? *)"
+    Description: EventBridge Scheduler cron expression (cron(...)).
+
+  StopCronExpression:
+    Type: String
+    Default: "cron(10 18 * * ? *)"
+    Description: EventBridge Scheduler cron expression (cron(...)).
+
+  ScheduleTimezone:
+    Type: String
+    Default: Asia/Seoul
+    Description: Scheduler timezone.
+
+  LogRetentionDays:
+    Type: Number
+    Default: 3
+    AllowedValues: [1,3,5,7,14,30,60,90,120,150,180,365,400,545,731,1827,3653]
+    Description: CloudWatch Logs retention days for Lambda log group.
+
+Conditions:
+  HasCodeVersion: !Not [!Equals [!Ref LambdaCodeS3ObjectVersion, ""]]
+
+Resources:
+  # ----------------------------
+  # Security Group for Lambda
+  # ----------------------------
+  FinOpsLambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${ProjectName} Lambda SG (egress tcp/443 only)"
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        # Slack API + AWS public endpoints (you said route table already supports egress)
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub "sgrp-${ProjectName}-${LambdaFunctionName}"
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ----------------------------
+  # CloudWatch Log Group (explicit)
+  # ----------------------------
+  FinOpsLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${LambdaFunctionName}"
+      RetentionInDays: !Ref LogRetentionDays
+
+  # ----------------------------
+  # Lambda Execution Role (least-privilege baseline)
+  # ----------------------------
+  FinOpsLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "role-${ProjectName}-${LambdaFunctionName}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: !Sub "policy-${ProjectName}-${LambdaFunctionName}"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # CloudWatch Logs
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+              # EC2
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:StartInstances
+                  - ec2:StopInstances
+                  - ec2:CreateNetworkInterface
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:DeleteNetworkInterface
+                  - ec2:AssignPrivateIpAddresses
+                  - ec2:UnassignPrivateIpAddresses
+                Resource: "*"
+
+              # RDS/Aurora
+              - Effect: Allow
+                Action:
+                  - rds:DescribeDBInstances
+                  - rds:DescribeDBClusters
+                  - rds:StartDBInstance
+                  - rds:StopDBInstance
+                  - rds:StartDBCluster
+                  - rds:StopDBCluster
+                  - rds:ListTagsForResource
+                Resource: "*"
+
+              # EKS Managed NodeGroup scaling
+              - Effect: Allow
+                Action:
+                  - eks:ListClusters
+                  - eks:DescribeCluster
+                  - eks:ListNodegroups
+                  - eks:DescribeNodegroup
+                  - eks:UpdateNodegroupConfig
+                Resource: "*"
+      Tags:
+        - Key: Name
+          Value: !Sub "role-${ProjectName}-${LambdaFunctionName}"
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ----------------------------
+  # Lambda Function
+  # ----------------------------
+  FinOpsLambdaFunction:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - FinOpsLambdaLogGroup
+    Properties:
+      FunctionName: !Ref LambdaFunctionName
+      Runtime: python3.14
+      Architectures: [x86_64]
+      Handler: finops_lambda_function.lambda_handler
+      Role: !GetAtt FinOpsLambdaRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      VpcConfig:
+        SecurityGroupIds: [!Ref FinOpsLambdaSecurityGroup]
+        SubnetIds: !Ref SubnetIds
+      Environment:
+        Variables:
+          ACTION: stop
+          REGIONS: !Ref Regions
+          EKS_DEFAULT_START_SIZE: !Ref EKSDefaultStartSize
+          EKS_DEFAULT_STOP_SIZE: !Ref EKSDefaultStopSize
+          SLACK_BOT_TOKEN: !Ref SlackBotToken
+          SLACK_CHANNEL: !Ref SlackChannel
+      Code:
+        S3Bucket: !Ref LambdaCodeS3Bucket
+        S3Key: !Ref LambdaCodeS3Key
+        S3ObjectVersion: !If [HasCodeVersion, !Ref LambdaCodeS3ObjectVersion, !Ref "AWS::NoValue"]
+      Tags:
+        - Key: Name
+          Value: !Ref LambdaFunctionName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ----------------------------
+  # Scheduler Execution Role
+  # ----------------------------
+  SchedulerExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "role-${ProjectName}-finops-scheduler"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: scheduler.amazonaws.com }
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: !Sub "policy-${ProjectName}-finops-scheduler-invoke-lambda"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource:
+                  - !GetAtt FinOpsLambdaFunction.Arn
+                  - !Sub "${FinOpsLambdaFunction.Arn}:*"
+      Tags:
+        - Key: Name
+          Value: !Sub "role-${ProjectName}-finops-scheduler"
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ----------------------------
+  # EventBridge Scheduler - Start
+  # ----------------------------
+  FinOpsStartSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub "${ProjectName}-finops-start-1"
+      Description: !Sub "FinOps START schedule -> ${LambdaFunctionName}"
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      ScheduleExpression: !Ref StartCronExpression
+      ScheduleExpressionTimezone: !Ref ScheduleTimezone
+      State: "ENABLED"
+      Target:
+        Arn: !GetAtt FinOpsLambdaFunction.Arn
+        RoleArn: !GetAtt SchedulerExecutionRole.Arn
+        Input: !Sub |
+          {"ACTION":"start","REGIONS":"${Regions}"}
+
+  # ----------------------------
+  # EventBridge Scheduler - Stop
+  # ----------------------------
+  FinOpsStopSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub "${ProjectName}-finops-stop-1"
+      Description: !Sub "FinOps STOP schedule -> ${LambdaFunctionName}"
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      ScheduleExpression: !Ref StopCronExpression
+      ScheduleExpressionTimezone: !Ref ScheduleTimezone
+      State: "ENABLED"
+      Target:
+        Arn: !GetAtt FinOpsLambdaFunction.Arn
+        RoleArn: !GetAtt SchedulerExecutionRole.Arn
+        Input: !Sub |
+          {"ACTION":"stop","REGIONS":"${Regions}"}
+
+  # ----------------------------
+  # Allow Scheduler to invoke Lambda (per schedule)
+  # ----------------------------
+  AllowSchedulerInvokeStart:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref FinOpsLambdaFunction
+      Action: "lambda:InvokeFunction"
+      Principal: "scheduler.amazonaws.com"
+      SourceArn: !GetAtt FinOpsStartSchedule.Arn
+
+  AllowSchedulerInvokeStop:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref FinOpsLambdaFunction
+      Action: "lambda:InvokeFunction"
+      Principal: "scheduler.amazonaws.com"
+      SourceArn: !GetAtt FinOpsStopSchedule.Arn
+
+Outputs:
+  LambdaArn:
+    Value: !GetAtt FinOpsLambdaFunction.Arn
+
+  StartScheduleArn:
+    Value: !GetAtt FinOpsStartSchedule.Arn
+
+  StopScheduleArn:
+    Value: !GetAtt FinOpsStopSchedule.Arn
+
+  LambdaSecurityGroupId:
+    Value: !Ref FinOpsLambdaSecurityGroup
+
+  LambdaCodeS3Location:
+    Value: !Sub "s3://${LambdaCodeS3Bucket}/${LambdaCodeS3Key}"
