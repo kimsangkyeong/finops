@@ -27,6 +27,7 @@
                 "logs:DescribeLogGroups",
                 "logs:DescribeLogStreams",
                 "logs:ListLogGroups",
+                "cloudwatch:GetMetricData",
                 "sns:GetTopicAttributes",
                 "sns:ConfirmSubscription",
                 "sns:CreateTopic",
