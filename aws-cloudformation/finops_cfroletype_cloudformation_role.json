@@ -1,0 +1,18 @@
+# finops_cfroletype_cloudformation_role.json
+
+1. assigned policy 
+  - custome managed policy
+     = finops_cfroletype_cloudformation_policy.json
+2. trust policy :
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "cloudformation.amazonaws.com"
+      },
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}
